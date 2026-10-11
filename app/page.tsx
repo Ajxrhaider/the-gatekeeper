@@ -150,7 +150,46 @@ export default function HomePage() {
   const [input, setInput] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [currentYear, setCurrentYear] = useState<number | null>(null);
+  const [isSessionReady, setIsSessionReady] = useState(false);
   const transcriptRef = useRef<HTMLDivElement>(null);
+  const sessionInitializationStartedRef = useRef(false);
+
+  useEffect(() => {
+    setCurrentYear(new Date().getFullYear());
+  }, []);
+
+  useEffect(() => {
+    if (sessionInitializationStartedRef.current) return;
+    sessionInitializationStartedRef.current = true;
+
+    async function initializeChallengeSession() {
+      try {
+        const response = await fetch("/api/chat/session", { method: "POST" });
+        const payload = (await response.json().catch(() => ({}))) as {
+          error?: unknown;
+        };
+
+        if (!response.ok) {
+          throw new Error(
+            typeof payload.error === "string"
+              ? payload.error
+              : `Could not start a challenge session (${response.status}).`,
+          );
+        }
+      } catch (sessionError) {
+        setError(
+          sessionError instanceof Error
+            ? sessionError.message
+            : "The chat service could not be reached. Please try again.",
+        );
+      } finally {
+        setIsSessionReady(true);
+      }
+    }
+
+    void initializeChallengeSession();
+  }, []);
 
   useEffect(() => {
     const transcript = transcriptRef.current;
@@ -165,7 +204,7 @@ export default function HomePage() {
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const prompt = input.trim();
-    if (!prompt || isLoading) return;
+    if (!prompt || isLoading || !isSessionReady) return;
 
     const userMessage: ChatMessage = {
       id: newMessageId(),
@@ -201,19 +240,18 @@ export default function HomePage() {
         throw new Error(message);
       }
 
-      if (typeof payload.reply !== "string" || !payload.reply.trim()) {
+      const replyText = payload.reply;
+      if (typeof replyText !== "string" || !replyText.trim()) {
         throw new Error("The model returned an empty reply. Please try again.");
       }
 
+      const assistantMessage: ChatMessage = {
+        id: newMessageId(),
+        role: "assistant",
+        content: replyText,
+      };
       setMessages((current) =>
-        [
-          ...current,
-          {
-            id: newMessageId(),
-            role: "assistant",
-            content: payload.reply as string,
-          },
-        ].slice(-MAX_HISTORY_MESSAGES),
+        [...current, assistantMessage].slice(-MAX_HISTORY_MESSAGES),
       );
     } catch (requestError) {
       setError(
@@ -233,10 +271,37 @@ export default function HomePage() {
     }
   }
 
-  function resetConversation() {
-    setMessages([WELCOME_MESSAGE]);
-    setInput("");
+  async function resetConversation() {
+    if (isLoading || !isSessionReady) return;
+
     setError(null);
+    setIsLoading(true);
+
+    try {
+      const response = await fetch("/api/chat/session", { method: "POST" });
+      const payload = (await response.json().catch(() => ({}))) as {
+        error?: unknown;
+      };
+
+      if (!response.ok) {
+        throw new Error(
+          typeof payload.error === "string"
+            ? payload.error
+            : `Could not start a new challenge session (${response.status}).`,
+        );
+      }
+
+      setMessages([WELCOME_MESSAGE]);
+      setInput("");
+    } catch (requestError) {
+      setError(
+        requestError instanceof Error
+          ? requestError.message
+          : "The chat service could not be reached. Please try again.",
+      );
+    } finally {
+      setIsLoading(false);
+    }
   }
 
   return (
@@ -281,7 +346,7 @@ export default function HomePage() {
               <span className="h-1.5 w-1.5 rounded-full bg-primary" />
               Prompt injection lab
               <span className="text-indigo-400/60">/</span>
-              Mistral v0.3
+              Gemini 3.5 Flash-Lite
             </div>
             <h1 className="font-display text-4xl font-bold leading-[1.05] tracking-tight text-white sm:text-5xl lg:text-6xl">
               Can you break
@@ -303,7 +368,7 @@ export default function HomePage() {
                 Model
               </span>
               <span className="mt-1 block font-mono text-xs text-slate-300">
-                Mistral 7B Instruct
+                Gemini 3.5 Flash-Lite
               </span>
             </div>
             <div className="rounded-xl border border-slate-800 bg-slate-900/60 px-3 py-2">
@@ -333,14 +398,16 @@ export default function HomePage() {
                   </h2>
                   <p className="mt-0.5 flex items-center gap-1.5 text-[11px] text-slate-500">
                     <span className="h-1.5 w-1.5 rounded-full bg-accent" />
-                    Active session · server-side inference
+                    {isSessionReady
+                      ? "Active session · server-side inference"
+                      : "Starting secure challenge session…"}
                   </p>
                 </div>
               </div>
               <button
                 type="button"
                 onClick={resetConversation}
-                disabled={isLoading}
+                disabled={isLoading || !isSessionReady}
                 className="inline-flex items-center gap-2 rounded-lg border border-slate-700 px-3 py-2 text-[10px] font-bold uppercase tracking-[0.12em] text-slate-400 transition hover:border-slate-500 hover:text-white disabled:cursor-not-allowed disabled:opacity-40"
                 aria-label="Reset conversation"
               >
@@ -400,12 +467,12 @@ export default function HomePage() {
                   onChange={(event) => setInput(event.target.value)}
                   onKeyDown={handleComposerKeyDown}
                   placeholder="Try a prompt injection…"
-                  disabled={isLoading}
+                  disabled={isLoading || !isSessionReady}
                   className="max-h-40 min-h-[48px] flex-1 resize-y border-0 bg-transparent px-2 py-2 text-sm leading-6 text-slate-100 outline-none placeholder:text-slate-600 focus:ring-0 disabled:cursor-not-allowed"
                 />
                 <button
                   type="submit"
-                  disabled={isLoading || !input.trim()}
+                  disabled={isLoading || !isSessionReady || !input.trim()}
                   aria-label="Send prompt"
                   className="mb-0.5 inline-flex h-10 shrink-0 items-center justify-center gap-2 rounded-xl bg-primary px-4 text-xs font-bold text-white shadow-lg shadow-indigo-950/40 transition hover:bg-primary-dark disabled:cursor-not-allowed disabled:opacity-40"
                 >
@@ -475,7 +542,7 @@ export default function HomePage() {
                     key={idea.number}
                     type="button"
                     onClick={() => setInput(idea.prompt)}
-                    disabled={isLoading}
+                    disabled={isLoading || !isSessionReady}
                     className="group flex w-full items-center gap-3 rounded-xl border border-slate-800 bg-slate-950/35 px-3 py-3 text-left transition hover:border-indigo-400/30 hover:bg-indigo-400/[0.04] disabled:cursor-not-allowed disabled:opacity-50"
                   >
                     <span className="font-mono text-[10px] text-indigo-400/70">
@@ -507,9 +574,9 @@ export default function HomePage() {
         </div>
 
         <footer className="flex flex-col gap-2 border-t border-slate-800/80 pt-5 mt-8 text-[10px] text-slate-600 sm:flex-row sm:items-center sm:justify-between">
-          <span>© {new Date().getFullYear()} Hizaki Labs · The Gatekeeper</span>
+          <span>© {currentYear ? `${currentYear} ` : ""}Hizaki Labs · The Gatekeeper</span>
           <span className="font-mono uppercase tracking-[0.13em]">
-            Mistral v0.3 · Hugging Face Inference
+            Gemini 3.5 Flash-Lite · Google Gemini API
           </span>
         </footer>
       </div>

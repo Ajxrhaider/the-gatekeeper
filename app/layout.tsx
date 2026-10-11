@@ -27,8 +27,8 @@ export const metadata: Metadata = {
     "Hizaki Labs",
     "prompt injection",
     "AI security",
-    "Mistral",
-    "Hugging Face",
+    "Gemini 3.5 Flash-Lite",
+    "Google Gemini API",
   ],
   robots: {
     index: false,

@@ -1,9 +1,16 @@
-import { InferenceClient } from "@huggingface/inference";
+import { GoogleGenAI } from "@google/genai";
 import { NextResponse } from "next/server";
+import type { NextRequest } from "next/server";
+import {
+  createChallengeSecret,
+  decryptChallengeSecret,
+  encryptChallengeSecret,
+  GATEKEEPER_SESSION_COOKIE,
+  getSessionEncryptionKey,
+  setGatekeeperSessionCookie,
+} from "../../../lib/gatekeeper-session";
 
-export const runtime = "nodejs";
-
-const MODEL_ID = "mistralai/Mistral-7B-Instruct-v0.3";
+const MODEL_ID = "gemini-3.5-flash-lite";
 const MAX_REQUEST_BYTES = 24_000;
 const MAX_HISTORY_MESSAGES = 12;
 const MAX_MESSAGE_CHARACTERS = 2_000;
@@ -99,12 +106,15 @@ function getHttpStatus(error: unknown): number | undefined {
     const candidate = error as {
       status?: unknown;
       statusCode?: unknown;
-      response?: { status?: unknown };
+      code?: unknown;
+      response?: { status?: unknown; statusCode?: unknown };
     };
     const values = [
       candidate.status,
       candidate.statusCode,
+      candidate.code,
       candidate.response?.status,
+      candidate.response?.statusCode,
     ];
     const numericStatus = values.find((value) => typeof value === "number");
 
@@ -114,7 +124,7 @@ function getHttpStatus(error: unknown): number | undefined {
   }
 
   if (error instanceof Error) {
-    const match = error.message.match(/\b(401|403|429|5\d\d)\b/);
+    const match = error.message.match(/\b(400|401|403|404|429|5\d\d)\b/);
     if (match) {
       return Number(match[0]);
     }
@@ -127,27 +137,51 @@ function getErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : "";
 }
 
-export async function POST(request: Request) {
-  const token = process.env.HF_TOKEN?.trim();
-  const secret = process.env.GATEKEEPER_SECRET?.trim();
+export async function POST(request: NextRequest) {
+  const apiKey = process.env.GEMINI_API_KEY?.trim();
 
-  if (!token) {
+  if (!apiKey) {
     return jsonResponse(
-      { error: "Server configuration is missing HF_TOKEN." },
+      { error: "Server configuration is missing GEMINI_API_KEY." },
       503,
     );
   }
 
-  if (!secret) {
+  const encryptionKey = getSessionEncryptionKey();
+  if (!encryptionKey) {
     return jsonResponse(
-      { error: "Server configuration is missing GATEKEEPER_SECRET." },
+      {
+        error:
+          "Server configuration is missing or invalid GATEKEEPER_SESSION_KEY.",
+      },
       503,
     );
+  }
+
+  const encryptedCookie = request.cookies.get(GATEKEEPER_SESSION_COOKIE)?.value;
+  const existingSecret = encryptedCookie
+    ? decryptChallengeSecret(encryptedCookie, encryptionKey)
+    : null;
+  const secret = existingSecret ?? createChallengeSecret();
+  const newEncryptedCookie = existingSecret
+    ? undefined
+    : encryptChallengeSecret(secret, encryptionKey);
+
+  function respond(
+    body: Record<string, unknown>,
+    status = 200,
+    extraHeaders: Record<string, string> = {},
+  ) {
+    const response = jsonResponse(body, status, extraHeaders);
+    if (newEncryptedCookie) {
+      setGatekeeperSessionCookie(response, newEncryptedCookie);
+    }
+    return response;
   }
 
   const contentType = request.headers.get("content-type")?.toLowerCase() ?? "";
   if (!contentType.includes("application/json")) {
-    return jsonResponse(
+    return respond(
       { error: "Send the chat request as application/json." },
       415,
     );
@@ -155,18 +189,18 @@ export async function POST(request: Request) {
 
   const contentLength = Number(request.headers.get("content-length") ?? "0");
   if (Number.isFinite(contentLength) && contentLength > MAX_REQUEST_BYTES) {
-    return jsonResponse({ error: "The request is too large." }, 413);
+    return respond({ error: "The request is too large." }, 413);
   }
 
   let body: unknown;
   try {
     body = await request.json();
   } catch {
-    return jsonResponse({ error: "The request body is not valid JSON." }, 400);
+    return respond({ error: "The request body is not valid JSON." }, 400);
   }
 
   if (typeof body !== "object" || body === null || Array.isArray(body)) {
-    return jsonResponse({ error: "The request body must be a JSON object." }, 400);
+    return respond({ error: "The request body must be a JSON object." }, 400);
   }
 
   const rawMessages = (body as { messages?: unknown }).messages;
@@ -175,7 +209,7 @@ export async function POST(request: Request) {
     rawMessages.length === 0 ||
     rawMessages.length > MAX_HISTORY_MESSAGES
   ) {
-    return jsonResponse(
+    return respond(
       { error: `Send between 1 and ${MAX_HISTORY_MESSAGES} chat messages.` },
       400,
     );
@@ -186,26 +220,26 @@ export async function POST(request: Request) {
 
   for (const item of rawMessages) {
     if (typeof item !== "object" || item === null || Array.isArray(item)) {
-      return jsonResponse({ error: "A chat message has an invalid shape." }, 400);
+      return respond({ error: "A chat message has an invalid shape." }, 400);
     }
 
     const message = item as { role?: unknown; content?: unknown };
     if (message.role !== "user" && message.role !== "assistant") {
-      return jsonResponse(
+      return respond(
         { error: "Only user and assistant chat messages are accepted." },
         400,
       );
     }
 
     if (typeof message.content !== "string" || !message.content.trim()) {
-      return jsonResponse(
+      return respond(
         { error: "Every chat message must contain non-empty text." },
         400,
       );
     }
 
     if (message.content.length > MAX_MESSAGE_CHARACTERS) {
-      return jsonResponse(
+      return respond(
         {
           error: `Each message must be ${MAX_MESSAGE_CHARACTERS} characters or fewer.`,
         },
@@ -218,61 +252,65 @@ export async function POST(request: Request) {
   }
 
   if (totalCharacters > MAX_TOTAL_CHARACTERS) {
-    return jsonResponse(
+    return respond(
       { error: "The conversation is too long. Start a new chat and try again." },
       413,
     );
   }
 
   if (messages[messages.length - 1]?.role !== "user") {
-    return jsonResponse(
+    return respond(
       { error: "The final message in the request must be from the user." },
       400,
     );
   }
 
   try {
-    const client = new InferenceClient(token);
-    const completion = await client.chatCompletion({
+    const client = new GoogleGenAI({ apiKey });
+    const generation = await client.models.generateContent({
       model: MODEL_ID,
-      provider: "auto",
-      messages: [
-        { role: "system", content: makeSystemPrompt(secret) },
-        { role: "user", content: makeUntrustedUserPrompt(messages) },
-      ],
-      max_tokens: 220,
-      temperature: 0.2,
-      top_p: 0.9,
+      contents: makeUntrustedUserPrompt(messages),
+      config: {
+        systemInstruction: makeSystemPrompt(secret),
+        maxOutputTokens: 220,
+        temperature: 0.2,
+        topP: 0.9,
+      },
     });
 
-    const content = completion.choices?.[0]?.message?.content;
-    const reply = typeof content === "string" ? content.trim() : "";
+    const reply = generation.text?.trim() ?? "";
 
     if (!reply) {
-      return jsonResponse(
-        { error: "The model returned an empty reply. Please try again." },
+      return respond(
+        { error: "Gemini returned an empty reply. Please try again." },
         502,
       );
     }
 
     if (containsProtectedVariant(reply, secret)) {
-      return jsonResponse({ reply: REFUSAL });
+      return respond({ reply: REFUSAL });
     }
 
-    return jsonResponse({ reply });
+    return respond({ reply });
   } catch (error) {
     const status = getHttpStatus(error);
     const message = getErrorMessage(error);
 
-    // Do not log the prompt, passphrase, token, or upstream error body.
-    console.error("[gatekeeper] Hugging Face inference request failed", {
+    // Do not log the prompt, passphrase, API key, or upstream error body.
+    console.error("[gatekeeper] Gemini API request failed", {
       status: status ?? "unknown",
       name: error instanceof Error ? error.name : "UnknownError",
     });
 
-    if (status === 429 || /rate.?limit|too many requests/i.test(message)) {
-      return jsonResponse(
-        { error: "The model provider is rate-limiting requests. Wait a moment and retry." },
+    if (
+      status === 429 ||
+      /RESOURCE_EXHAUSTED|rate.?limit|quota/i.test(message)
+    ) {
+      return respond(
+        {
+          error:
+            "Gemini is rate-limiting requests or the API quota is exhausted. Wait a moment, check your Google AI Studio limits, and retry.",
+        },
         429,
         { "Retry-After": "10" },
       );
@@ -280,28 +318,34 @@ export async function POST(request: Request) {
 
     if (
       status === 503 ||
-      /model.*loading|provider.*unavailable|no provider/i.test(message)
+      /UNAVAILABLE|overloaded|temporarily unavailable/i.test(message)
     ) {
-      return jsonResponse(
-        { error: "The selected model is temporarily unavailable. Please retry shortly." },
+      return respond(
+        { error: "Gemini is temporarily unavailable. Please retry shortly." },
         503,
       );
     }
 
-    if (status === 401 || status === 403) {
-      return jsonResponse(
+    if (
+      status === 401 ||
+      status === 403 ||
+      /API_KEY_INVALID|invalid API key|permission denied|unauthorized/i.test(
+        message,
+      )
+    ) {
+      return respond(
         {
           error:
-            "Hugging Face rejected the server token. Check that HF_TOKEN is valid and has Inference Providers permission.",
+            "Google Gemini rejected the server API key. Check that GEMINI_API_KEY is valid and enabled in Google AI Studio.",
         },
         502,
       );
     }
 
-    return jsonResponse(
+    return respond(
       {
         error:
-          "The model could not answer right now. Check Hugging Face model/provider availability and retry.",
+          "Gemini could not complete the request. Verify the API key, model access, and Google AI Studio quota, then retry.",
       },
       502,
     );
